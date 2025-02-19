@@ -1,71 +1,87 @@
 import psycopg
-import mysql.connector
-from datetime import datetime
 import os
+import json
+from datetime import datetime
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
-db1_name = os.getenv('DB1_NAME')
-db1_user = os.getenv('DB1_USER')
-db1_password = os.getenv('DB1_PASSWORD')
-db1_host = os.getenv('DB1_HOST')
-db1_port = os.getenv('DB1_PORT')
+def get_db_connection(db_name, db_user, db_password, db_host, db_port):
+    """Establish a connection to a PostgreSQL database."""
+    return psycopg.connect(
+        dbname=db_name,
+        user=db_user,
+        password=db_password,
+        host=db_host,
+        port=db_port
+    )
 
-# Koneksi ke PostgreSQL
-pg_conn = psycopg.connect(
-    dbname=db1_name,  # Ganti dengan nama database PostgreSQL
-    user=db1_user,       # Ganti dengan username PostgreSQL
-    password=db1_password,  # Ganti dengan password PostgreSQL
-    host=db1_host,  # Ganti dengan host PostgreSQL, jika diperlukan
-    port=db1_port        # Port default PostgreSQL
-)
+def adapt_data(row):
+    """Convert dictionary fields to JSON strings for psycopg."""
+    return tuple(json.dumps(value) if isinstance(value, dict) else value for value in row)
 
-pg_cursor = pg_conn.cursor()
+def migrate_table(source_conn, dest_conn, table_name):
+    """Migrate data from source to destination for a specific table."""
+    source_cursor = source_conn.cursor()
+    dest_cursor = dest_conn.cursor()
 
-db2_name = os.getenv('DB2_NAME')
-db2_user = os.getenv('DB2_USER')
-db2_password = os.getenv('DB2_PASSWORD')
-db2_host = os.getenv('DB2_HOST')
-db2_port = os.getenv('DB2_PORT')
+    # Get the max ID from the destination database
+    dest_cursor.execute(f"SELECT MAX(id) FROM {table_name}")
+    max_id = dest_cursor.fetchone()[0] or 0
 
-# Koneksi ke PostgreSQL
-pg_conn_dest = psycopg.connect(
-    dbname=db2_name,  # Ganti dengan nama database PostgreSQL
-    user=db2_user,       # Ganti dengan username PostgreSQL
-    password=db2_password,  # Ganti dengan password PostgreSQL
-    host=db2_host,  # Ganti dengan host PostgreSQL, jika diperlukan
-    port=db2_port        # Port default PostgreSQL
-)
+    # Fetch new data from the source database
+    source_cursor.execute(f"SELECT * FROM {table_name} WHERE id > %s", (max_id,))
+    new_data = source_cursor.fetchall()
 
-pg_cursor_dest = pg_conn_dest.cursor()
+    if new_data:
+        # Generate insert query dynamically
+        column_names = [desc[0] for desc in source_cursor.description]
+        columns = ', '.join(column_names)
+        placeholders = ', '.join(['%s'] * len(column_names))
+        insert_query = f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})"
 
-# 1. Cek max(id) di MySQL untuk menentukan ID terakhir yang sudah ada
-pg_cursor_dest.execute("SELECT MAX(id) FROM mqtt_data")
-max_id_mysql = pg_cursor_dest.fetchone()[0]
-if max_id_mysql is None:
-    max_id_mysql = 0  # Jika tabel kosong, set id mulai dari 0
+        # Convert data before insertion
+        adapted_data = [adapt_data(row) for row in new_data]
 
-# 2. Ambil data dari PostgreSQL dengan ID yang lebih besar dari max_id_mysql
-pg_cursor.execute("SELECT id, topic, payload, received_at FROM mqtt_data WHERE id > %s", (max_id_mysql,))
-new_data = pg_cursor.fetchall()
+        # Insert new data
+        dest_cursor.executemany(insert_query, adapted_data)
+        dest_conn.commit()
 
-# 3. Menyisipkan data yang baru ke MySQL
-if new_data:
-    insert_query = """
-    INSERT INTO mqtt_data (id, topic, payload, received_at)
-    VALUES (%s, %s, %s, %s)
-    """
-    pg_cursor_dest.executemany(insert_query, new_data)
-    pg_conn_dest.commit()  # Commit perubahan ke MySQL
-    
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{timestamp}] {len(new_data)} baris data berhasil dipindahkan ke PostgresSQL.")
-else:
-    print("Tidak ada data baru yang perlu dipindahkan.")
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{timestamp}] {len(new_data)} rows migrated from {table_name}.")
+    else:
+        print(f"No new data to migrate for {table_name}.")
 
-# Menutup koneksi
-pg_cursor.close()
-pg_conn.close()
-pg_cursor_dest.close()
-pg_conn_dest.close()
+    # Close cursors
+    source_cursor.close()
+    dest_cursor.close()
+
+if __name__ == "__main__":
+    # Source DB credentials
+    source_conn = get_db_connection(
+        os.getenv('DB1_NAME'),
+        os.getenv('DB1_USER'),
+        os.getenv('DB1_PASSWORD'),
+        os.getenv('DB1_HOST'),
+        os.getenv('DB1_PORT')
+    )
+
+    # Destination DB credentials
+    dest_conn = get_db_connection(
+        os.getenv('DB2_NAME'),
+        os.getenv('DB2_USER'),
+        os.getenv('DB2_PASSWORD'),
+        os.getenv('DB2_HOST'),
+        os.getenv('DB2_PORT')
+    )
+
+    # List of tables to migrate
+    tables_to_migrate = ['mqtt_data', 'movie_xx1_data']
+
+    for table in tables_to_migrate:
+        migrate_table(source_conn, dest_conn, table)
+
+    # Close connections
+    source_conn.close()
+    dest_conn.close()
